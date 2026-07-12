@@ -4,6 +4,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
 *.so
 
 # Virtual environments
@@ -25,6 +30,7 @@ models/
 
 # Experiment outputs
 *.log
+*.ncu-rep
 
 # OS
 .DS_Store
