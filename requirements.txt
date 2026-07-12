@@ -1,0 +1,19 @@
+# HyGEMM - Hybrid Precision GEMM Error Analysis
+# Environment: Python 3.12+, CUDA 12.1+
+
+# Core ML
+torch>=2.5.0
+transformers>=5.0.0
+accelerate>=1.0.0
+
+# Model & data
+huggingface_hub>=1.0.0
+safetensors>=0.8.0
+numpy>=2.0.0
+
+# Visualization & analysis
+matplotlib>=3.0.0
+
+# Development (optional)
+# pytest>=8.0.0
+# pre-commit>=3.0.0

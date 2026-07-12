@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & models (stored externally)
+data/
+models/
+*.bin
+*.safetensors
+
+# Experiment outputs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
