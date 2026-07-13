@@ -61,3 +61,24 @@ target_compile_options(hygemm_sm120_mma_mixing PRIVATE
 target_compile_definitions(hygemm_sm120_mma_mixing PRIVATE
   CUTLASS_ENABLE_TENSOR_CORE_MMA=1
 )
+
+add_executable(hygemm_sm120_execution_policy_bench
+  src/kernel/sm120_execution_policy_bench.cu
+)
+
+target_include_directories(hygemm_sm120_execution_policy_bench PRIVATE
+  "${CUTLASS_DIR}/include"
+)
+
+target_compile_options(hygemm_sm120_execution_policy_bench PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:
+    -gencode=arch=compute_120a,code=sm_120a
+    --expt-relaxed-constexpr
+    --expt-extended-lambda
+    -lineinfo
+  >
+)
+
+target_compile_definitions(hygemm_sm120_execution_policy_bench PRIVATE
+  CUTLASS_ENABLE_TENSOR_CORE_MMA=1
+)
