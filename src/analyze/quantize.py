@@ -100,3 +100,8 @@ def quantize_w4a4(w: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch
 def quantize_w4a8(w: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """MXFP4 weights and MXFP8-E4M3 activations, block-scaled along K."""
     return quantize_mxfp4(w, block_dim=1), quantize_mxfp8_e4m3(x, block_dim=0)
+
+
+def quantize_w8a4(w: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-E4M3 weights and MXFP4 activations, block-scaled along K."""
+    return quantize_mxfp8_e4m3(w, block_dim=1), quantize_mxfp4(x, block_dim=0)
