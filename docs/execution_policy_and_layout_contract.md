@@ -99,10 +99,14 @@ classification.
 
 ## Addressing contract
 
-The MMA mainloop uses contiguous, affine TMA traversal inside each stream:
+The MMA mainloop uses contiguous, affine TMA traversal inside each stream.
+Milestone 2 executes HH before LL because the stock high collective owns the
+single accumulator initialization, after which OMMA accumulates into the same
+fragment; this reduction-order reversal is numerically equivalent and avoids a
+second clear or accumulator buffer:
 
-1. iterate the LL stream with K64 OMMA;
-2. iterate the HH stream as pairs of K32 W4A8 QMMA;
+1. iterate the HH stream as pairs of K32 W4A8 QMMA;
+2. iterate the LL stream with K64 OMMA;
 3. optionally iterate matching MIX-low/MIX-high records and alternate the two
    K32 QMMA types;
 4. execute one epilogue from the shared FP32 accumulator.
