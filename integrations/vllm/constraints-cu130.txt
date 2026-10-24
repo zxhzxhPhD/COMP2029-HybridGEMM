@@ -1,0 +1,13 @@
+# Common serving stack for the MixLLM / HyGEMM integration experiment.
+vllm==0.26.0
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+transformers==5.13.0
+flashinfer-python==0.6.14
+nvidia-cutlass-dsl==4.6.0
+# Prevent unbounded FlashInfer build dependencies from installing CUDA 13.4.
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-cuda-cccl==13.0.85

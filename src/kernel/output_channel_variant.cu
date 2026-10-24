@@ -113,8 +113,8 @@ template<bool FP8> class Instance final : public Kernel {
   Gemm gemm_;
   cutlass::device_memory::allocation<uint8_t> workspace_;
   KernelInfo info_;
- public:
-  Instance(DeviceProblem const& p,cudaStream_t stream) {
+  DeviceProblem shape_;
+  static auto arguments(DeviceProblem const& p) {
     if (p.rows<=0 || p.tokens<=0 || p.input_channels<=0 || p.input_channels%128 ||
         p.rows>p.output_channels || !p.weight || !p.activation || !p.weight_scales || !p.activation_scales ||
         !p.channel_ids || !p.output) throw std::runtime_error("Invalid output-channel GEMM problem");
@@ -132,6 +132,11 @@ template<bool FP8> class Instance final : public Kernel {
        static_cast<cutlass::float_ue8m0_t const*>(p.weight_scales),la,
        static_cast<cutlass::float_ue8m0_t const*>(p.activation_scales),lb},
       {{static_cast<cutlass::half_t*>(p.output),p.channel_ids,p.output_channels},nullptr,sc,nullptr,sd}};
+    return args;
+  }
+ public:
+  Instance(DeviceProblem const& p,cudaStream_t stream):shape_(p) {
+    auto args=arguments(p);
     check(gemm_.can_implement(args));
     workspace_.reset(Gemm::get_workspace_size(args));
     check(gemm_.initialize(args,workspace_.get(),stream));
@@ -143,6 +148,11 @@ template<bool FP8> class Instance final : public Kernel {
   }
   void run(cudaStream_t stream) override { check(gemm_.run(stream)); }
   KernelInfo info() const override { return info_; }
+  bool update_operands(DeviceProblem const& p) override {
+    if(p.rows!=shape_.rows || p.tokens!=shape_.tokens || p.input_channels!=shape_.input_channels ||
+       p.output_channels!=shape_.output_channels) throw std::runtime_error("Rebinding cannot change GEMM shape");
+    check(gemm_.update(arguments(p),workspace_.get()));return true;
+  }
 };
 
 } // variant-specific namespace

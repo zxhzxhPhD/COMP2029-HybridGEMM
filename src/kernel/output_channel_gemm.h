@@ -32,6 +32,10 @@ class Kernel {
   virtual ~Kernel() = default;
   virtual void run(cudaStream_t stream) = 0;
   virtual KernelInfo info() const = 0;
+  // Rebind pointers for an unchanged problem shape without allocating workspace.
+  // Serving adapters use this before graph capture/replay setup. Not all
+  // implementations support rebinding; false means unsupported.
+  virtual bool update_operands(DeviceProblem const&) { return false; }
 };
 
 constexpr int variant_count = 8;

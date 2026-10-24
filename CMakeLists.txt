@@ -183,3 +183,15 @@ target_include_directories(hygemm_output_channel_fused_bench PRIVATE "${CUTLASS_
 target_compile_options(hygemm_output_channel_fused_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr>)
 target_link_libraries(hygemm_output_channel_fused_bench PRIVATE hygemm_output_channel_fused hygemm_output_channel CUDA::cublasLt)
+
+# Framework-independent serving ABI; PyTorch owns the tensors and supplies its
+# current stream. Device GEMMs remain the existing two-kernel implementation.
+set_target_properties(hygemm_output_channel PROPERTIES POSITION_INDEPENDENT_CODE ON)
+foreach(id RANGE 0 7)
+  set_target_properties(hygemm_oc_${id} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endforeach()
+add_library(hygemm_serving SHARED integrations/vllm/native/runtime.cu)
+target_include_directories(hygemm_serving PRIVATE "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
+target_compile_options(hygemm_serving PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr>)
+target_link_libraries(hygemm_serving PRIVATE hygemm_output_channel CUDA::cudart)
