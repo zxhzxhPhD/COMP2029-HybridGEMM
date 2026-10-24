@@ -54,7 +54,7 @@ def padded_ids(ids):
 
 
 class MixLinear:
-    def __init__(self, weight, high_ids):
+    def __init__(self, weight, high_ids,plans=None):
         load_library()
         self.outputs, self.k = weight.shape
         mask = torch.zeros(self.outputs, dtype=torch.bool, device=weight.device)
@@ -63,6 +63,7 @@ class MixLinear:
         q8, s8, _ = quantize_weight(weight[hi.long()], 8)
         q4, s4, z4 = quantize_weight(weight[lo.long()], 4)
         self.initialize(q8, q4, s8, s4, z4, hi, lo)
+        self.plans=plans
 
     def initialize(self, q8, q4, s8, s4, z4, hi, lo):
         self.k = q8.shape[1] if q8.shape[0] else q4.shape[1]
@@ -75,6 +76,9 @@ class MixLinear:
         self.s8, self.s4, self.z4 = pad_cols(s8, 2), pad_cols(s4, 2), pad_cols(z4, 4)
         self.hi, self.lo = padded_ids(hi), padded_ids(lo)
         self.calls = {}
+        self.plans=None
+        self.forced_config=None
+        self.plans_used={}
         self.config_dir = Path(os.environ['MIXLLM_LIBRARY']).resolve().parent.parent / 'source/best_config'
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -103,9 +107,17 @@ class MixLinear:
     def __call__(self, x):
         if x.ndim != 2 or x.shape[1] != self.k or x.dtype != torch.float16 or x.device != self.q8.device or not x.is_contiguous():
             raise ValueError('MixLLM requires contiguous CUDA FP16 input matching its weights')
-        self.seed_smoke_plan(x.shape[0])
+        selected=self.forced_config
+        if self.plans:
+            plan=self.plans.get(self.outputs,self.k,self.hi.numel(),x.shape[0])
+            selected=(plan['stage'],plan['id'])
+            self.plans_used[x.shape[0]]=[plan['tokens'],*selected]
+        if selected is None:self.seed_smoke_plan(x.shape[0])
         a, sa = torch.ops.kernels_mixllm.quantize(x)
-        y = torch.ops.kernels_mixllm.gemm(a, sa, self.z4, self.s8, self.s4, self.hi, self.lo, self.q8, self.q4)
+        if selected is None:
+            y=torch.ops.kernels_mixllm.gemm(a,sa,self.z4,self.s8,self.s4,self.hi,self.lo,self.q8,self.q4)
+        else:
+            y=torch.ops.kernels_mixllm.gemm_planned(a,sa,self.z4,self.s8,self.s4,self.hi,self.lo,self.q8,self.q4,*selected)
         if self.hi.numel() and self.lo.numel():
             # Preserve the original LinearMixLLM transpose dispatch.
             y = (torch.ops.kernels_mixllm.transpose(y) if self.outputs in [4096,14336,1024,6144,28672]

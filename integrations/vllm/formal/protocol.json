@@ -1,0 +1,18 @@
+{
+  "models": ["Qwen2.5-0.5B", "Qwen2.5-1.5B", "Qwen2.5-3B", "Qwen2.5-7B"],
+  "model_revisions": {
+    "0.5B": "060db6499f32faf8b98477b0a26969ef7d8b9987",
+    "1.5B": "8faed761d45a263340a0528343f099c05c9a4323",
+    "3B": "3aab1f1954e9cc14eb9509a215f9e5ca08227a9b",
+    "7B": "d149729398750b98c0af14eb82c78cfe92750796"
+  },
+  "methods": ["fp16", "mixllm", "hygemm"],
+  "stack": {"vllm": "0.26.0", "torch": "2.11.0+cu130", "cuda_toolkit": "13.0.48", "device": "RTX 5090 SM120"},
+  "calibration": {"split": "WikiText-2 train", "seed": 2029, "samples": 32, "length": 512, "score": "MixLLM full: E[abs(t+0.5*t*t)]", "budget": "10% global output channels", "shared_mask_between_methods": true},
+  "execution": {"tensor_parallel": 1, "dtype": "float16", "kv_dtype": "float16", "kv_cache_bytes": 10737418240, "inductor": false, "requested_graph": "FULL", "measured_decode_graph_assertion": "every measured step calls run_fullgraph", "attention": "FLASH_ATTN", "prefix_caching": false, "max_batched_tokens": 2048, "max_model_len": 2049},
+  "decode": {"batches": [1,2,4,8,16,32,64,128], "prompt_lengths": [128,1024], "new_tokens": 129, "warmups": 1, "samples": 5, "cv_limit": 0.05, "max_attempts": 3, "minimum_measured_full_batch_steps": 32, "metric": "CUDA event span across pure fixed-batch decode, from execute_model to sample_tokens; include between-step idle gaps; exclude prefill/mixed steps"},
+  "ppl": {"dataset": "complete WikiText-2 test", "block_length": 2048, "stride": 2048, "targets_per_block": 2047, "add_bos": false, "batch": 8, "batch_control": "first 8 blocks, batch 1", "batch_control_max_nll_per_token_delta": 0.001},
+  "autotuning": {"token_buckets": [1,2,4,8,16,32,64,128,256,512,1024,2048], "representative": "median high-channel count within O/K/purity", "screen": "all legal original MixLLM candidates; HyGEMM 8 isolated candidates per path then top3 pairs under serial/concurrent", "refine": "top 3 plans on every actual O/K/high count", "runtime": "exact O/K/high key; ceiling token bucket", "timing": "resident inputs, includes pack/output layout; 3x32 graph calls", "correctness": "finite output and dequantized reference at sampled output/position coordinates"},
+  "environment_control": "No clock locking, cooldown, thermal admission or external-noise investigation. One GPU experiment process at a time. Preserve all stability attempts, accept first CV<=5%; otherwise mark unstable.",
+  "claims": "Actual measured serving decode speed and WT2 PPL under this protocol; no claim of globally optimal tiling or matched output quality."
+}

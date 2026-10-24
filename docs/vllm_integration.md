@@ -188,11 +188,10 @@ as diagnostics, not accepted for the next speed/quality comparison. This small
 control establishes a usable common mode; it does not prove general numerical
 equivalence or attribute the drift to one specific compiled operator.
 
-Before the next speed/quality round, fix a shared execution mode, attention
-backend, KV precision, model revision, selection/calibration protocol and
-request mix. Tune the actual model shapes for both paths; neither the inherited
-4096-wide microbenchmark plans nor the smoke dispatch proves optimality for
-896/4864-wide Qwen projections. A 10% **channel** map is not necessarily a 10%
-**weight-element** budget; the preparation manifest reports both. Report
-activation packing and output-layout costs, fixed-history numerical checks and
-quality metrics separately from free-generation examples.
+The formal four-model speed/quality runner is documented in
+[formal_decode_protocol.md](formal_decode_protocol.md). It freezes the common
+execution mode, attention backend, KV precision, model revisions, calibration
+and request mix; tunes the actual fused shapes and partition widths for both
+paths; and audits FULL Graph dispatches during decode. Results and source/binary
+provenance remain in the experiment's tmp directory. A 10% **channel** map is
+not necessarily a 10% **weight-element** budget; both totals are recorded.

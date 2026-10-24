@@ -44,7 +44,7 @@ def pack(x, fp4=False):
 
 
 class DualLinear:
-    def __init__(self, weight, high_ids, low_id=0, high_id=0, concurrent=True):
+    def __init__(self, weight, high_ids, low_id=0, high_id=0, concurrent=True, plans=None):
         self.outputs, self.k = weight.shape
         mask = torch.zeros(self.outputs, dtype=torch.bool, device=weight.device)
         mask[high_ids] = True
@@ -55,6 +55,8 @@ class DualLinear:
         self.low_id, self.high_id, self.concurrent = low_id, high_id, concurrent
         self.handles = {}
         self.calls = {}
+        self.plans=plans
+        self.plans_used={}
 
     def __call__(self, x):
         if x.ndim != 2 or x.shape[1] != self.k or x.device != self.w4.device:
@@ -66,15 +68,20 @@ class DualLinear:
         h = Problem(self.hi.numel(), x.shape[0], self.k, self.outputs, self.w8.data_ptr(), q.data_ptr(),
                     self.sf8.data_ptr(), sf.data_ptr(), self.hi.data_ptr(), y.data_ptr())
         stream = torch.cuda.current_stream(x.device).cuda_stream
-        key = x.shape[0]
+        li,hi,concurrent=self.low_id,self.high_id,self.concurrent
+        if self.plans:
+            plan=self.plans.get(self.outputs,self.k,self.hi.numel(),x.shape[0])
+            li,hi,concurrent=plan['low_id'],plan['high_id'],plan['policy']=='concurrent'
+            self.plans_used[x.shape[0]]=[plan['tokens'],li,hi,concurrent]
+        key = (x.shape[0],li,hi,self.lo.numel(),self.hi.numel())
         if key not in self.handles:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(f'HyGEMM shape T={key} must be warmed before graph capture')
             handle = C.c_void_p()
-            check(library().hg_create(self.low_id, self.high_id, C.byref(l), C.byref(h), stream, C.byref(handle)))
+            check(library().hg_create(li,hi,C.byref(l),C.byref(h),stream,C.byref(handle)))
             self.handles[key] = handle
-        check(library().hg_run(self.handles[key], C.byref(l), C.byref(h), stream, self.concurrent))
-        self.calls[key] = self.calls.get(key, 0) + 1
+        check(library().hg_run(self.handles[key], C.byref(l), C.byref(h), stream, concurrent))
+        self.calls[x.shape[0]] = self.calls.get(x.shape[0], 0) + 1
         return y
 
     def close(self):

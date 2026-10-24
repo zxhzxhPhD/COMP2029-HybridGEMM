@@ -35,6 +35,10 @@ class CommonConfig(QuantizationConfig):
         self.low_id = int(config.get('low_id', 0))
         self.high_id = int(config.get('high_id', 0))
         self.concurrent = bool(config.get('concurrent', True))
+        self.plans=None
+        if config.get('tuning_plan'):
+            from .plans import PlanTable
+            self.plans=PlanTable(config['tuning_plan'],self.kind)
         if self.format not in ['fp16_rtn', 'mixllm_v1'] or (self.format == 'mixllm_v1' and self.kind != 'mixllm'):
             raise ValueError('Unsupported checkpoint format')
 
@@ -130,6 +134,7 @@ class MixedLinearMethod(LinearMethodBase):
                 raise ValueError('Checkpoint channel maps must form a permutation')
             self.runtime = MixLinear.from_checkpoint(layer.qweight, layer.scale, layer.zero,
                                                        layer.indices, layer.is_int8_channel)
+            self.runtime.plans=self.config.plans
             for name in ['qweight', 'scale', 'zero', 'indices', 'is_int8_channel']:
                 delattr(layer, name)
         else:
@@ -137,10 +142,10 @@ class MixedLinearMethod(LinearMethodBase):
             ids = self.selected_rows(w.device)
             if self.config.kind == 'mixllm':
                 from .mixllm import MixLinear
-                self.runtime = MixLinear(w, ids)
+                self.runtime = MixLinear(w, ids,self.config.plans)
             else:
                 from .native import DualLinear
-                self.runtime = DualLinear(w, ids, self.config.low_id, self.config.high_id, self.config.concurrent)
+                self.runtime = DualLinear(w, ids, self.config.low_id, self.config.high_id, self.config.concurrent,self.config.plans)
             del layer.weight
         self.handle = id(self.runtime)
         _runtimes[self.handle] = self.runtime
@@ -160,5 +165,6 @@ def model_audit(model):
         if isinstance(method, MixedLinearMethod) and method.runtime is not None:
             r = method.runtime
             layers.append({'name':name, 'kind':method.config.kind, 'k':method.k, 'outputs':method.outputs,
-                           'high':r.hi.numel(), 'low':r.lo.numel(), 'calls_by_tokens':dict(r.calls)})
+                           'high':r.hi.numel(), 'low':r.lo.numel(), 'calls_by_tokens':dict(r.calls),
+                           'plans_used':dict(r.plans_used)})
     return layers
