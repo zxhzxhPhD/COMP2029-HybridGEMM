@@ -38,12 +38,27 @@ struct Runner {
   }
 };
 
-template<bool FP4,class Layout>
+template<bool FP4,bool InitPadding=false,class Layout>
 __global__ void pack_mx(__half const*input,uint8_t*output,uint8_t*scales,int rows,int k,Layout layout) {
   int lane=threadIdx.x%32;
   int group=(blockIdx.x*blockDim.x+threadIdx.x)/32;
   if(group>=rows*(k/32))return;
   int row=group/(k/32),col=(group%(k/32))*32+lane;
+  if constexpr(InitPadding){
+    // Small activation batches occupy one 128-row scale block. The first
+    // warp of each K128 block owns all *padding* scale words for that block.
+    // Its coalesced 32-bit stores never overlap any valid-row scale byte,
+    // so no inter-CTA barrier or separate memset node is necessary.
+    if(row==0 && group%4==0){
+      auto* words=reinterpret_cast<uint32_t*>(scales+layout(0,col-lane,0));
+#pragma unroll
+      for(int step=0;step<4;++step){
+        int word=lane+step*32;
+        int scale_row=(word%4)*32+word/4;
+        if(scale_row>=rows)words[word]=0x7f7f7f7fu;
+      }
+    }
+  }
   float value=__half2float(input[int64_t(row)*k+col]),maximum=fabsf(value);
   for(int d=16;d;d/=2)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d));
   // Conservative RTN smoke quantizer: smallest power-of-two scale that avoids
@@ -70,14 +85,30 @@ int hg_pack(void const*in,void*out,void*sf,int rows,int k,int fp4,void*stream) {
   auto layout=BS::tile_atom_to_shape_SFA(cute::make_shape(rows,1,k,1));
   auto b=BS::tile_atom_to_shape_SFB(cute::make_shape(1,rows,k,1));
   static_assert(std::is_same_v<decltype(layout),decltype(b)>);
-  check(cudaMemsetAsync(sf,127,cute::cosize(layout),s));
   int blocks=(int64_t(rows)*k+127)/128;
-  if(fp4)pack_mx<true><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
-  else pack_mx<false><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+  if(!fp4 && rows<=32){
+    pack_mx<false,true><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+  }else{
+    check(cudaMemsetAsync(sf,127,cute::cosize(layout),s));
+    if(fp4)pack_mx<true><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+    else pack_mx<false><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+  }
   check(cudaGetLastError());HG_CATCH}
 int hg_create(int low_id,int high_id,DeviceProblem const*l,DeviceProblem const*h,void*s,void**handle){HG_TRY
   *handle=new Runner(low_id,high_id,*l,*h,static_cast<cudaStream_t>(s));HG_CATCH}
 int hg_run(void*handle,DeviceProblem const*l,DeviceProblem const*h,void*s,int concurrent){HG_TRY
   static_cast<Runner*>(handle)->run(*l,*h,static_cast<cudaStream_t>(s),concurrent);HG_CATCH}
+// Optional offline inspection API. It does not participate in forward calls.
+int hg_info(void*handle,int*output){HG_TRY
+  auto* runner=static_cast<Runner*>(handle);
+  std::fill(output,output+20,-1);
+  for(int part=0;part<2;++part){
+    auto* kernel=(part ? runner->high.get() : runner->low.get());
+    if(!kernel)continue;
+    auto i=kernel->info();int* dst=output+part*10;
+    int values[]={i.id,i.tile_m,i.tile_n,i.tile_k,i.stages,i.registers_per_thread,i.shared_bytes,i.local_bytes,int(i.fp8_weight),int(i.pingpong)};
+    std::copy(values,values+10,dst);
+  }
+  HG_CATCH}
 void hg_destroy(void*handle){delete static_cast<Runner*>(handle);}
 }
