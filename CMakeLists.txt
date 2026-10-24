@@ -158,3 +158,28 @@ target_include_directories(hygemm_output_channel_bench PRIVATE "${CUTLASS_DIR}/i
 target_compile_options(hygemm_output_channel_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr>)
 target_link_libraries(hygemm_output_channel_bench PRIVATE hygemm_output_channel CUDA::cublasLt)
+
+set(OC_FUSED_OBJECTS)
+foreach(id RANGE 0 7)
+  list(GET OC_TILES_N ${id} tile_n)
+  list(GET OC_TILES_K ${id} tile_k)
+  list(GET OC_STAGES ${id} stages)
+  list(GET OC_PINGPONG ${id} pingpong)
+  add_library(hygemm_oc_fused_${id} OBJECT src/kernel/output_channel_fused_variant.cu)
+  target_include_directories(hygemm_oc_fused_${id} PRIVATE "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
+  target_compile_definitions(hygemm_oc_fused_${id} PRIVATE CUTLASS_ENABLE_TENSOR_CORE_MMA=1
+    HYGEMM_OC_VARIANT_ID=${id} HYGEMM_OC_TILE_N=${tile_n} HYGEMM_OC_TILE_K=${tile_k}
+    HYGEMM_OC_STAGES=${stages} HYGEMM_OC_PINGPONG=${pingpong})
+  target_compile_options(hygemm_oc_fused_${id} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo;-Xptxas=-v>)
+  list(APPEND OC_FUSED_OBJECTS $<TARGET_OBJECTS:hygemm_oc_fused_${id}>)
+endforeach()
+add_library(hygemm_output_channel_fused STATIC src/kernel/output_channel_fused.cpp ${OC_FUSED_OBJECTS})
+target_link_libraries(hygemm_output_channel_fused PUBLIC CUDA::cudart)
+target_include_directories(hygemm_output_channel_fused PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel")
+
+add_executable(hygemm_output_channel_fused_bench src/kernel/output_channel_fused_bench.cu)
+target_include_directories(hygemm_output_channel_fused_bench PRIVATE "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
+target_compile_options(hygemm_output_channel_fused_bench PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr>)
+target_link_libraries(hygemm_output_channel_fused_bench PRIVATE hygemm_output_channel_fused hygemm_output_channel CUDA::cublasLt)

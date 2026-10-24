@@ -115,6 +115,8 @@ struct Inputs {
   void reset() {
     CUDA(cudaMemset(guarded_output.get(),0x5a,guarded_output.size()*sizeof(Half)));
     CUDA(cudaMemset(output(),0xff,int64_t(o.outputs)*o.tokens*sizeof(Half)));
+    // Kernels use nonblocking streams; explicitly finish default-stream fills.
+    CUDA(cudaDeviceSynchronize());
   }
   float reference(int out,int token) const {
     float sum=0;
@@ -216,6 +218,7 @@ float fp16_baseline(Inputs& d,Streams& streams) {
   BLAS(cublasLtMatmulDescDestroy(desc));BLAS(cublasLtDestroy(h));return us;
 }
 
+#ifndef HYGEMM_OC_BENCH_UTILS_ONLY
 int main(int argc,char const**argv) try {
   std::cout<<std::setprecision(9);Options o(argc,argv);cudaDeviceProp prop;CUDA(cudaGetDeviceProperties(&prop,0));
   if(prop.major!=12)throw std::runtime_error("SM12x required");Streams streams;Inputs inputs(o);
@@ -270,3 +273,4 @@ int main(int argc,char const**argv) try {
   std::cout<<",\"high_config\":";if(best_h>=0)print_info(kernel(true,best_h)->info());else std::cout<<"null";std::cout<<"}"<<std::endl;
   return 0;
 }catch(std::exception const&e){std::cerr<<"ERROR: "<<e.what()<<std::endl;return 1;}
+#endif
