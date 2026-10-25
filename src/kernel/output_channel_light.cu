@@ -72,7 +72,7 @@ struct Storage {
   }
 };
 
-template<int BM, int BN, int BK, int Warps, int Stages, bool FP8>
+template<int BM, int BN, int BK, int Warps, int Stages, bool FP8, bool CacheScale = false>
 __global__ __launch_bounds__(Warps * 32)
 void kernel(DeviceProblem p) {
   using S = Storage<BM, BN, BK, Warps, Stages, FP8>;
@@ -104,8 +104,21 @@ void kernel(DeviceProblem p) {
     if (next < tiles) S::load(storage + (next % Stages) * S::StageBytes, p, m0, n0, next * BK);
     asm volatile("cp.async.commit_group;\n" ::);
     uint8_t* current = storage + (tile % Stages) * S::StageBytes;
+    uint32_t cached_sa[S::WarpM / 16], cached_sb[BN / 8];
 #pragma unroll
     for (int kk = 0; kk < BK / 32; ++kk) {
+      if constexpr (CacheScale) {
+        if (kk % 4 == 0) {
+#pragma unroll
+          for (int mi = 0; mi < S::WarpM / 16; ++mi) {
+            int r = warp * S::WarpM + mi * 16 + (lane % 2) * 8 + lane / 4;
+            cached_sa[mi] = *reinterpret_cast<uint32_t const*>(current + S::ASize + S::BSize + r * S::Groups + kk);
+          }
+#pragma unroll
+          for (int ni = 0; ni < BN / 8; ++ni)
+            cached_sb[ni] = *reinterpret_cast<uint32_t const*>(current + S::ASize + S::BSize + S::SFASize + (ni * 8 + lane / 4) * S::Groups + kk);
+        }
+      }
       uint32_t b[BN / 8][2];
       uint8_t sb[BN / 8];
 #pragma unroll
@@ -115,7 +128,8 @@ void kernel(DeviceProblem p) {
         unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(current + S::ASize + S::swizzle(row, col)));
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                      : "=r"(b[ni][0]), "=r"(b[ni][1]) : "r"(address));
-        sb[ni] = current[S::ASize + S::BSize + S::SFASize + (ni * 8 + lane / 4) * S::Groups + kk];
+        if constexpr (CacheScale) sb[ni] = uint8_t(cached_sb[ni] >> (8 * (kk % 4)));
+        else sb[ni] = current[S::ASize + S::BSize + S::SFASize + (ni * 8 + lane / 4) * S::Groups + kk];
       }
 #pragma unroll
       for (int mi = 0; mi < S::WarpM / 16; ++mi) {
@@ -133,7 +147,9 @@ void kernel(DeviceProblem p) {
           for (int j = 0; j < 4; ++j) a[j] <<= 2;
         }
         int sfrow = warp * S::WarpM + mi * 16 + (lane % 2) * 8 + lane / 4;
-        uint8_t sa = current[S::ASize + S::BSize + sfrow * S::Groups + kk];
+        uint8_t sa;
+        if constexpr (CacheScale) sa = uint8_t(cached_sa[mi] >> (8 * (kk % 4)));
+        else sa = current[S::ASize + S::BSize + sfrow * S::Groups + kk];
         using A = std::conditional_t<FP8, F8, F4>;
 #pragma unroll
         for (int ni = 0; ni < BN / 8; ++ni) {
@@ -163,7 +179,7 @@ void kernel(DeviceProblem p) {
   }
 }
 
-template<int Id, int BM, int BN, int BK, int Warps, int Stages, bool FP8>
+template<int Id, int BM, int BN, int BK, int Warps, int Stages, bool FP8, bool CacheScale = false>
 class Instance final : public Kernel {
   DeviceProblem problem_;
   KernelInfo info_;
@@ -172,13 +188,13 @@ class Instance final : public Kernel {
     if (p.rows <= 0 || p.tokens <= 0 || p.input_channels <= 0 || p.input_channels % 128 || p.rows > p.output_channels)
       throw std::runtime_error("Invalid lightweight GEMM shape");
     cudaFuncAttributes attr{};
-    auto status = cudaFuncGetAttributes(&attr, kernel<BM, BN, BK, Warps, Stages, FP8>);
+    auto status = cudaFuncGetAttributes(&attr, kernel<BM, BN, BK, Warps, Stages, FP8, CacheScale>);
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     info_ = {Id, BM, BN, BK, Stages, attr.numRegs, int(attr.sharedSizeBytes), int(attr.localSizeBytes), FP8, false};
   }
   void run(cudaStream_t stream) override {
     dim3 grid((problem_.rows + BM - 1) / BM, (problem_.tokens + BN - 1) / BN);
-    kernel<BM, BN, BK, Warps, Stages, FP8><<<grid, Warps * 32, 0, stream>>>(problem_);
+    kernel<BM, BN, BK, Warps, Stages, FP8, CacheScale><<<grid, Warps * 32, 0, stream>>>(problem_);
     auto status = cudaGetLastError();
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
   }
@@ -195,6 +211,7 @@ class Instance final : public Kernel {
 namespace hygemm::oc {
 std::unique_ptr<Kernel> make_light(int id, bool fp8, DeviceProblem const& p, cudaStream_t) {
 #define LIGHT(ID, M, N, K, W, S) case ID: if (fp8) return std::make_unique<light::Instance<ID,M,N,K,W,S,true>>(p); else return std::make_unique<light::Instance<ID,M,N,K,W,S,false>>(p);
+#define CACHED(ID, M, N, K, W, S) case ID: if (fp8) return std::make_unique<light::Instance<ID,M,N,K,W,S,true,true>>(p); else return std::make_unique<light::Instance<ID,M,N,K,W,S,false,true>>(p);
   switch (id) {
     LIGHT(8, 32, 8, 128, 2, 2)
     LIGHT(9, 64, 8, 128, 4, 2)
@@ -216,8 +233,19 @@ std::unique_ptr<Kernel> make_light(int id, bool fp8, DeviceProblem const& p, cud
     LIGHT(25, 32, 16, 128, 2, 4)
     LIGHT(26, 64, 16, 128, 4, 4)
     LIGHT(27, 16, 8, 256, 1, 4)
+    CACHED(35, 32, 8, 128, 2, 2)
+    CACHED(36, 64, 8, 128, 2, 2)
+    CACHED(37, 64, 16, 128, 4, 2)
+    CACHED(38, 128, 8, 128, 4, 2)
+    CACHED(39, 128, 16, 128, 4, 2)
+    CACHED(40, 64, 8, 256, 2, 3)
+    CACHED(41, 32, 8, 128, 2, 3)
+    CACHED(42, 64, 16, 128, 4, 4)
+    CACHED(43, 128, 8, 256, 4, 2)
+    CACHED(44, 128, 8, 128, 8, 2)
     default: throw std::runtime_error("Invalid lightweight variant ID");
   }
 #undef LIGHT
+#undef CACHED
 }
 } // namespace hygemm::oc

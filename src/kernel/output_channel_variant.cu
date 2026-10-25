@@ -83,7 +83,10 @@ template<bool FP8> struct Configuration {
   using Weight = cute::conditional_t<FP8,cutlass::mx_float8_t<cutlass::float_e4m3_t>,
                                        cutlass::mx_float4_t<cutlass::float_e2m1_t>>;
   using Activation = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-  using Tile = Shape<_128,Int<HYGEMM_OC_TILE_N>,Int<HYGEMM_OC_TILE_K>>;
+#ifndef HYGEMM_OC_TILE_M
+#define HYGEMM_OC_TILE_M 128
+#endif
+  using Tile = Shape<Int<HYGEMM_OC_TILE_M>,Int<HYGEMM_OC_TILE_N>,Int<HYGEMM_OC_TILE_K>>;
   using Cluster = Shape<_1,_1,_1>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm120,cutlass::arch::OpClassTensorOp,Tile,Cluster,

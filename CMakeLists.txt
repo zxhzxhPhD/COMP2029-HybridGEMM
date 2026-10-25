@@ -155,7 +155,11 @@ target_compile_definitions(hygemm_oc_light PRIVATE CUTLASS_ENABLE_TENSOR_CORE_MM
 target_compile_options(hygemm_oc_light PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr;-lineinfo;-Xptxas=-v>)
 set_target_properties(hygemm_oc_light PROPERTIES POSITION_INDEPENDENT_CODE ON)
-add_library(hygemm_output_channel STATIC src/kernel/output_channel_gemm.cpp ${OC_OBJECTS} $<TARGET_OBJECTS:hygemm_oc_light>)
+add_library(hygemm_oc_gemv OBJECT src/kernel/output_channel_gemv.cu)
+target_compile_options(hygemm_oc_gemv PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;-lineinfo;-Xptxas=-v>)
+set_target_properties(hygemm_oc_gemv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(hygemm_output_channel STATIC src/kernel/output_channel_gemm.cpp ${OC_OBJECTS} $<TARGET_OBJECTS:hygemm_oc_light> $<TARGET_OBJECTS:hygemm_oc_gemv>)
 target_link_libraries(hygemm_output_channel PUBLIC CUDA::cudart)
 target_include_directories(hygemm_output_channel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel")
 
@@ -172,6 +176,7 @@ foreach(id RANGE 0 7)
   list(GET OC_STAGES ${id} stages)
   list(GET OC_PINGPONG ${id} pingpong)
   add_library(hygemm_oc_fused_${id} OBJECT src/kernel/output_channel_fused_variant.cu)
+  set_target_properties(hygemm_oc_fused_${id} PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(hygemm_oc_fused_${id} PRIVATE "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
   target_compile_definitions(hygemm_oc_fused_${id} PRIVATE CUTLASS_ENABLE_TENSOR_CORE_MMA=1
     HYGEMM_OC_VARIANT_ID=${id} HYGEMM_OC_TILE_N=${tile_n} HYGEMM_OC_TILE_K=${tile_k}
@@ -181,6 +186,7 @@ foreach(id RANGE 0 7)
   list(APPEND OC_FUSED_OBJECTS $<TARGET_OBJECTS:hygemm_oc_fused_${id}>)
 endforeach()
 add_library(hygemm_output_channel_fused STATIC src/kernel/output_channel_fused.cpp ${OC_FUSED_OBJECTS})
+set_target_properties(hygemm_output_channel_fused PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(hygemm_output_channel_fused PUBLIC CUDA::cudart)
 target_include_directories(hygemm_output_channel_fused PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel")
 
@@ -201,3 +207,14 @@ target_include_directories(hygemm_serving PRIVATE "${CUTLASS_DIR}/include" "${CU
 target_compile_options(hygemm_serving PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr>)
 target_link_libraries(hygemm_serving PRIVATE hygemm_output_channel CUDA::cudart)
+
+add_library(hygemm_producer SHARED integrations/vllm/native/producer.cu)
+target_include_directories(hygemm_producer PRIVATE "${CUTLASS_DIR}/include")
+target_compile_options(hygemm_producer PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr;-lineinfo;-Xptxas=-v>)
+target_link_libraries(hygemm_producer PRIVATE CUDA::cudart)
+
+add_library(hygemm_fused_probe SHARED integrations/vllm/native/fused_probe.cu)
+target_compile_options(hygemm_fused_probe PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)
+target_link_libraries(hygemm_fused_probe PRIVATE hygemm_output_channel_fused CUDA::cudart)

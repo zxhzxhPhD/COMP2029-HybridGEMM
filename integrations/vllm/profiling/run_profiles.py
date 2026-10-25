@@ -12,6 +12,7 @@ ap.add_argument('--formal', type=Path, required=True)
 ap.add_argument('--out', type=Path, required=True)
 ap.add_argument('--probes', action='store_true', help='Also run the small non-serving Graph diagnostics')
 args = ap.parse_args()
+args.out.mkdir(parents=True, exist_ok=True)
 script = Path(__file__).with_name('profile_decode.py')
 status = args.out / 'status.json'
 jobs = [(kind, None) for kind in ['mixllm', 'hygemm']]

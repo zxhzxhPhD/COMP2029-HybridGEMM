@@ -3,6 +3,7 @@ import argparse
 from bisect import bisect_right
 from collections import Counter, defaultdict
 import json
+import re
 from pathlib import Path
 import sqlite3
 import statistics
@@ -53,9 +54,20 @@ def classify(row):
         if table == 'memset':
             assert row['value'] == 127
             return 'activation_quant', 'scale_init'
-        if 'pack_mx<' in name or 'quantize_fg_sym_f16s8' in name:
+        if 'pack_mx' in name or 'quantize_fg_sym_f16s8' in name:
             return 'activation_quant', 'quantize'
+        if 'silu_mx<' in name:
+            return 'fused_producer_quant', 'silu_plus_mx_pack'
+        if 'gemv::pair_kernel<' in name:return 'gemm','mixed'
+        if 'gemv::reduce<' in name:return 'gemm','partial_reduce'
+        if 'gemv::kernel<' in name:
+            match=re.search(r'gemv::kernel<(true|false)',name)
+            return 'gemm',('high' if match.group(1)=='true' else 'low') if match else 'partition_unknown'
+        if 'light::kernel<' in name:
+            match=re.search(r'light::kernel<(?:\d+,\s*){5}(true|false)(?:,\s*(true|false))?>',name)
+            return 'gemm',('high' if match.group(1)=='true' else 'low') if match else 'partition_unknown'
         if 'cutlass::device_kernel<' in name:
+            if 'OutputChannelSwitchCollective' in name:return 'gemm','mixed'
             return 'gemm', 'low' if 'float_e2m1_t' in name else 'high'
         if 'Gemm' in name or 'gemm' in name:
             return 'gemm', 'low' if 'int4b_t' in name or 'integer_subbyte<' in name else 'high'
@@ -68,7 +80,7 @@ def classify(row):
         return 'attention_kv', 'attention_kv'
     if any(s in name for s in ['gemm', 'gemv', 'Gemm', 'cublas']):
         return 'lm_head', 'dense_linear'
-    if any(s in name for s in ['rms_norm', 'rotary_embedding', 'silu_and_mul', 'CUDAFunctor_add', 'indexSelect']):
+    if any(s in name for s in ['rms_norm', 'rotary_embedding', 'silu_and_mul', 'act_and_mul', 'CUDAFunctor_add', 'indexSelect']):
         return 'other_model_gpu', 'norm_rope_silu_bias_embedding'
     return 'framework_gpu', 'preprocess_sampling_other'
 
@@ -153,7 +165,9 @@ def main():
         rows = [r for r in activities if r.get('graphNodeId') and r['correlationId'] == launch['correlationId']]
         graph_starts[ordinal] = min(r['start'] for r in rows)
         graph_ends[ordinal] = max(r['end'] for r in rows)
-        packs = [r for r in rows if r['subtype'] == 'quantize']
+        # The fused SwiGLU producer replaces exactly one standalone quantizer
+        # per down projection; keep the same complete-projection invariant.
+        packs = [r for r in rows if r['subtype'] in ('quantize', 'silu_plus_mx_pack')]
         assert len(packs) == 112
         assert len({r['projection'].split('|')[1] for r in packs}) == 112
         for pack in packs:
@@ -206,20 +220,22 @@ def main():
         gaps = Counter()
         for group in by_launch.values():
             parts = {cat: [r for r in group if r['category'] == cat]
-                     for cat in ['activation_quant', 'gemm', 'output_layout']}
+                     for cat in ['activation_quant', 'fused_producer_quant', 'gemm', 'output_layout']}
             bounds = {cat: (min(r['start'] for r in rs), max(r['end'] for r in rs))
                       for cat, rs in parts.items() if rs}
             gaps['internal_idle_us'] += max(r['end'] for r in group) - min(r['start'] for r in group) - union_ns([(r['start'], r['end']) for r in group])
-            gaps['quant_to_gemm_gap_us'] += bounds['gemm'][0] - bounds['activation_quant'][1]
+            quant_categories = [cat for cat in ('activation_quant', 'fused_producer_quant') if cat in bounds]
+            assert len(quant_categories) == 1
+            gaps['quant_to_gemm_gap_us'] += bounds['gemm'][0] - bounds[quant_categories[0]][1]
             for cat, (a, b) in bounds.items():
                 gaps[cat + '_stage_idle_us'] += b - a - union_ns([(r['start'], r['end']) for r in parts[cat]])
             if parts['output_layout']:
                 gaps['gemm_to_layout_gap_us'] += bounds['output_layout'][0] - bounds['gemm'][1]
         result.update({k: v / 1e3 / (last - first) for k, v in gaps.items()})
-        for category in ['activation_quant', 'gemm', 'output_layout']:
+        for category in ['activation_quant', 'fused_producer_quant', 'gemm', 'output_layout']:
             spans = [(r['start'], r['end']) for r in rows if r['category'] == category]
             result['categories_us'][category] = union_ns(spans) / 1e3 / (last - first)
-        for subtype in ['quantize', 'scale_init', 'low', 'high', 'transpose_copy']:
+        for subtype in ['quantize', 'silu_plus_mx_pack', 'scale_init', 'low', 'high', 'transpose_copy']:
             sub = [r for r in rows if r['subtype'] == subtype]
             result[subtype + '_sum_us'] = sum(r['end'] - r['start'] for r in sub) / 1e3 / (last - first)
             result[subtype + '_count_per_step'] = len(sub) / (last - first)

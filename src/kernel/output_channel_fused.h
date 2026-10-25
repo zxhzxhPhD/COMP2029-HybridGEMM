@@ -10,6 +10,7 @@ struct FusedInfo {
 class FusedKernel : public Kernel {
  public:
   virtual FusedInfo fused_info() const = 0;
+  virtual bool update_problems(DeviceProblem const&,DeviceProblem const&) { return false; }
 };
 // Both problems describe the same X/Y and K/T/O; either weight partition may
 // be empty. audit is optional device uint32_t[6], initially zero:

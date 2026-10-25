@@ -11,6 +11,7 @@
 
 using hygemm::oc::DeviceProblem;
 using BS=cutlass::detail::Sm1xxBlockScaledConfig<32>;
+namespace hygemm::oc {void run_gemv_pair(DeviceProblem const&,DeviceProblem const&,cudaStream_t,int);}
 static thread_local std::string last_error;
 static void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 #define HG_TRY try {
@@ -27,13 +28,17 @@ struct Runner {
     check(cudaEventCreateWithFlags(&join,cudaEventDisableTiming));
   }
   ~Runner(){cudaEventDestroy(fork);cudaEventDestroy(join);cudaStreamDestroy(side);}
-  void run(DeviceProblem const&l,DeviceProblem const&h,cudaStream_t s,bool concurrent) {
+  void run(DeviceProblem const&l,DeviceProblem const&h,cudaStream_t s,int policy) {
     if(low && !low->update_operands(l))throw std::runtime_error("Low kernel cannot rebind");
     if(high && !high->update_operands(h))throw std::runtime_error("High kernel cannot rebind");
-    if(concurrent && low && high){
+    if(policy>=4 && policy<=6){
+      hygemm::oc::run_gemv_pair(l,h,s,1<<(policy-4));
+    }else if((policy==1 || policy==3) && low && high){
       check(cudaEventRecord(fork,s));check(cudaStreamWaitEvent(side,fork));
-      low->run(s);high->run(side);check(cudaEventRecord(join,side));check(cudaStreamWaitEvent(s,join));
-    }else {if(low)low->run(s);if(high)high->run(s);}
+      if(policy==1){low->run(s);high->run(side);}else{high->run(s);low->run(side);}
+      check(cudaEventRecord(join,side));check(cudaStreamWaitEvent(s,join));
+    }else if(policy==2){if(high)high->run(s);if(low)low->run(s);}
+    else {if(low)low->run(s);if(high)high->run(s);}
     check(cudaGetLastError());
   }
 };
@@ -74,6 +79,39 @@ __global__ void pack_mx(__half const*input,uint8_t*output,uint8_t*scales,int row
   }else output[int64_t(row)*k+col]=cutlass::float_e4m3_t(scaled).raw();
 }
 
+// Four FP16 values per lane, eight lanes per K32 group. Scale rounding and
+// FP8 conversion deliberately match pack_mx; only loads/reduction/packing differ.
+template<class Layout>
+__global__ void pack_mx_vector(__half const* input,uint8_t* output,uint8_t* scales,int rows,int k,Layout layout) {
+  int tid=blockIdx.x*blockDim.x+threadIdx.x,lane=threadIdx.x%8;
+  int group=tid/8;
+  if(group>=rows*(k/32))return;
+  int row=group/(k/32),col=(group%(k/32))*32+lane*4;
+  // Last 128-row scale block: the first four groups jointly initialize
+  // disjoint padding words. No valid scale byte overlaps these stores.
+  if(row==(rows/128)*128 && rows%128 && group%4==0) {
+    auto* words=reinterpret_cast<uint32_t*>(scales+layout(row,col-lane*4,0));
+#pragma unroll
+    for(int step=0;step<16;++step){
+      int word=lane+step*8,r=(word%4)*32+word/4;
+      if(r>=rows%128)words[word]=0x7f7f7f7fu;
+    }
+  }
+  uint2 raw=*reinterpret_cast<uint2 const*>(input+int64_t(row)*k+col);
+  float2 a=__half22float2(*reinterpret_cast<__half2*>(&raw.x));
+  float2 b=__half22float2(*reinterpret_cast<__half2*>(&raw.y));
+  float v[4]={a.x,a.y,b.x,b.y};
+  float maximum=fmaxf(fmaxf(fabsf(a.x),fabsf(a.y)),fmaxf(fabsf(b.x),fabsf(b.y)));
+  for(int d=4;d;d/=2)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d,8));
+  int exponent=maximum>0?int(ceilf(log2f(maximum/448.f))):0;
+  exponent=max(-127,min(127,exponent));
+  if(lane==0)scales[layout(row,col,0)]=uint8_t(exponent+127);
+  uint32_t packed=0;
+#pragma unroll
+  for(int i=0;i<4;++i)packed|=uint32_t(cutlass::float_e4m3_t(ldexpf(v[i],-exponent)).raw())<<(i*8);
+  *reinterpret_cast<uint32_t*>(output+int64_t(row)*k+col)=packed;
+}
+
 extern "C" {
 char const* hg_last_error(){return last_error.c_str();}
 int64_t hg_scale_size(int rows,int k){
@@ -93,6 +131,17 @@ int hg_pack(void const*in,void*out,void*sf,int rows,int k,int fp4,void*stream) {
     if(fp4)pack_mx<true><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
     else pack_mx<false><<<blocks,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
   }
+  check(cudaGetLastError());HG_CATCH}
+int hg_pack_mode(void const*in,void*out,void*sf,int rows,int k,int fp4,void*stream,int mode) {HG_TRY
+  if(fp4 || mode==0)return hg_pack(in,out,sf,rows,k,fp4,stream);
+  if(rows<=0||k<=0||k%128||!in||!out||!sf)throw std::runtime_error("Invalid MX pack arguments");
+  auto s=static_cast<cudaStream_t>(stream);
+  auto layout=BS::tile_atom_to_shape_SFA(cute::make_shape(rows,1,k,1));
+  if(mode==1 && rows<=128) {
+    pack_mx<false,true><<<(int64_t(rows)*k+127)/128,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+  }else if(mode==2){
+    pack_mx_vector<<<(int64_t(rows)*k/4+127)/128,128,0,s>>>((__half const*)in,(uint8_t*)out,(uint8_t*)sf,rows,k,layout);
+  }else return hg_pack(in,out,sf,rows,k,fp4,stream);
   check(cudaGetLastError());HG_CATCH}
 int hg_create(int low_id,int high_id,DeviceProblem const*l,DeviceProblem const*h,void*s,void**handle){HG_TRY
   *handle=new Runner(low_id,high_id,*l,*h,static_cast<cudaStream_t>(s));HG_CATCH}

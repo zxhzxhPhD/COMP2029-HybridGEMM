@@ -106,8 +106,19 @@ class Instance final:public FusedKernel {
   Gemm gemm;
   cutlass::device_memory::allocation<uint8_t> workspace;
   FusedInfo metadata;
+  DeviceProblem low_shape,high_shape;
+  uint32_t* audit_;
+  static typename Gemm::Arguments arguments(DeviceProblem const&l,DeviceProblem const&h,uint32_t*audit) {
+    int low_virtual=(l.rows+127)/128*128,virtual_rows=low_virtual+(h.rows+127)/128*128;
+    auto sc=cutlass::make_cute_packed_stride(typename GK::StrideC{},{virtual_rows,l.tokens,1});
+    auto sd=cutlass::make_cute_packed_stride(typename GK::StrideD{},{virtual_rows,l.tokens,1});
+    return {cutlass::gemm::GemmUniversalMode::kGemm,{virtual_rows,l.tokens,l.input_channels,1},
+      {partition_args<Low>(l,h),partition_args<High>(h,l),l.rows,h.rows,audit},
+      {{static_cast<cutlass::half_t*>(l.output),l.channel_ids,h.channel_ids,l.rows,h.rows,low_virtual,l.output_channels},nullptr,sc,nullptr,sd}};
+  }
  public:
-  Instance(DeviceProblem const&l,DeviceProblem const&h,cudaStream_t stream,uint32_t*audit) {
+  Instance(DeviceProblem const&l,DeviceProblem const&h,cudaStream_t stream,uint32_t*audit)
+    :low_shape(l),high_shape(h),audit_(audit) {
     if(l.rows<0 || h.rows<0 || l.rows+h.rows!=l.output_channels || l.output_channels<=0 ||
        l.output_channels!=h.output_channels || l.tokens<=0 || l.tokens!=h.tokens || l.input_channels<=0 ||
        l.input_channels%128 || l.input_channels!=h.input_channels || l.activation!=h.activation ||
@@ -115,11 +126,7 @@ class Instance final:public FusedKernel {
        (l.rows && (!l.weight || !l.weight_scales || !l.channel_ids)) ||
        (h.rows && (!h.weight || !h.weight_scales || !h.channel_ids))) throw std::runtime_error("Invalid fused partition contract");
     int low_virtual=(l.rows+127)/128*128,virtual_rows=low_virtual+(h.rows+127)/128*128;
-    auto sc=cutlass::make_cute_packed_stride(typename GK::StrideC{},{virtual_rows,l.tokens,1});
-    auto sd=cutlass::make_cute_packed_stride(typename GK::StrideD{},{virtual_rows,l.tokens,1});
-    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,{virtual_rows,l.tokens,l.input_channels,1},
-      {partition_args<Low>(l,h),partition_args<High>(h,l),l.rows,h.rows,audit},
-      {{static_cast<cutlass::half_t*>(l.output),l.channel_ids,h.channel_ids,l.rows,h.rows,low_virtual,l.output_channels},nullptr,sc,nullptr,sd}};
+    auto args=arguments(l,h,audit);
     check(gemm.can_implement(args));workspace.reset(Gemm::get_workspace_size(args));check(gemm.initialize(args,workspace.get(),stream));
     cudaFuncAttributes a{};auto status=cudaFuncGetAttributes(&a,cutlass::device_kernel<GK>);
     if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));
@@ -130,6 +137,14 @@ class Instance final:public FusedKernel {
   void run(cudaStream_t stream) override {check(gemm.run(stream));}
   KernelInfo info() const override {return metadata.kernel;}
   FusedInfo fused_info() const override {return metadata;}
+  bool update_problems(DeviceProblem const&l,DeviceProblem const&h) override {
+    auto same=[](DeviceProblem const&a,DeviceProblem const&b){
+      return a.rows==b.rows && a.tokens==b.tokens && a.input_channels==b.input_channels && a.output_channels==b.output_channels;
+    };
+    if(!same(l,low_shape)||!same(h,high_shape)||l.activation!=h.activation||l.activation_scales!=h.activation_scales||l.output!=h.output)
+      throw std::runtime_error("Fused rebind must preserve shape and shared X/Y");
+    check(gemm.update(arguments(l,h,audit_),workspace.get()));return true;
+  }
 };
 }
 std::unique_ptr<FusedKernel> OC_CAT(make_fused_variant_,HYGEMM_OC_VARIANT_ID)(DeviceProblem const&l,DeviceProblem const&h,cudaStream_t s,uint32_t*a) {

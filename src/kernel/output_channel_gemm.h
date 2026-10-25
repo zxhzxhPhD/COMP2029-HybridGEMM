@@ -38,7 +38,7 @@ class Kernel {
   virtual bool update_operands(DeviceProblem const&) { return false; }
 };
 
-constexpr int variant_count = 28;
+constexpr int variant_count = 45;
 // Throws std::runtime_error for an unsupported/invalid problem or CUDA failure.
 std::unique_ptr<Kernel> make_kernel(int variant, bool fp8_weight,
                                   DeviceProblem const&, cudaStream_t stream);

@@ -1,6 +1,7 @@
 """Opt-in Q2/Q3 loader. All forward computation remains the existing DualLinear."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import torch
 from vllm.model_executor.layers.linear import LinearBase,UnquantizedLinearMethod
@@ -17,7 +18,7 @@ class InheritedLayerPlans:
     def get(self,outputs,k,high,tokens):
         assert (outputs,k,high)==self.actual
         if self.override is not None and tokens<=128:
-            return self.override.get(outputs,k,high,tokens)
+            return self.override.get_layer(self.reference['layer'],outputs,k,high,tokens)
         # Retain the same per-layer arithmetic/tile configuration as Q1, while
         # permitting the new high partition width. No missing-shape fallback.
         return self.base.get(outputs,k,self.reference['high'],tokens)
@@ -34,6 +35,23 @@ class OfflineConfig(HyGEMMConfig):
         self.bank_path=Path(config['q4_bank']) if config.get('q4_bank') else None
         self.bank=json.loads(self.bank_path.read_text()) if self.bank_path else None
         self.decode_plans=PlanTable(config['decode_plans'],'hygemm') if config.get('decode_plans') else None
+        if self.decode_plans is not None and self.decode_plans.binding:
+            canonical=json.dumps(config['selection'],sort_keys=True,separators=(',',':')).encode()
+            if hashlib.sha256(canonical).hexdigest()!=self.decode_plans.binding['selection_canonical_sha256']:
+                raise ValueError('Tuning plan is bound to a different channel selection')
+            if self.bank_path is None or hashlib.sha256(self.bank_path.read_bytes()).hexdigest()!=self.decode_plans.binding['bank_manifest_sha256']:
+                raise ValueError('Tuning plan is bound to a different FP4 bank')
+            binding=self.decode_plans.binding
+            defaults={'HYGEMM_PACK_MODE':'0','HYGEMM_FUSE_SILU':'0','HYGEMM_SILU_MATH':'0',
+                      'HYGEMM_ROW_ORDER':'none','HYGEMM_FUSED_GATEUP':'0'}
+            for name,value in binding.get('runtime_options',{}).items():
+                if name not in defaults or os.environ.get(name,defaults[name])!=str(value):
+                    raise ValueError(f'Tuning plan runtime option mismatch: {name}')
+            for key,variable in [('producer_sha256','HYGEMM_PRODUCER_LIBRARY'),('fused_sha256','HYGEMM_FUSED_LIBRARY')]:
+                if binding.get(key):
+                    path=Path(os.environ[variable])
+                    if hashlib.sha256(path.read_bytes()).hexdigest()!=binding[key]:
+                        raise ValueError(f'Tuning plan is bound to a different {key}')
 
     @classmethod
     def get_name(cls):return 'hygemm_offline'
@@ -45,13 +63,22 @@ class OfflineConfig(HyGEMMConfig):
 
 
 class OfflineLinearMethod(MixedLinearMethod):
+    def _row_order(self,runtime):
+        mode=os.environ.get('HYGEMM_ROW_ORDER','none')
+        if mode!='none' and self.prefix.endswith('.gate_up_proj'):
+            from .row_order import reorder_runtime_rows
+            reorder_runtime_rows(runtime,mode)
+
     def process_weights_after_loading(self,layer):
         super().process_weights_after_loading(layer)
         r=self.runtime
+        r.layer_name=self.prefix
         reference=self.config.reference_layers[self.prefix]
         assert (reference['out'],reference['k'])==(r.outputs,r.k)
         r.plans=InheritedLayerPlans(self.config.reference_plans,reference,(r.outputs,r.k,r.hi.numel()),self.config.decode_plans)
-        if self.config.bank is None or not r.lo.numel():return
+        if self.config.bank is None or not r.lo.numel():
+            self._row_order(r)
+            return
         if self.prefix.endswith('.qkv_proj'):
             names=[self.prefix.replace('.qkv_proj','.'+p+'_proj') for p in ['q','k','v']]
         elif self.prefix.endswith('.gate_up_proj'):
@@ -67,3 +94,4 @@ class OfflineLinearMethod(MixedLinearMethod):
             assert value['scales'].shape==(rows,r.k//32)
             qs.append(value['q4']);scales.append(value['scales'])
         replace_low_weight(r,torch.cat(qs),torch.cat(scales),verify_native=self.config.bank['mode']=='native_rtn')
+        self._row_order(r)

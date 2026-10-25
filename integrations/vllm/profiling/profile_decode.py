@@ -48,6 +48,10 @@ def main():
               'configuration': {'inductor': False, 'graph': 'FULL', 'capture_sizes': CAPTURE_SIZES,
                                 'max_num_seqs': 128, 'max_num_batched_tokens': 2048, 'kv_cache_bytes': 10 * 1024**3},
               'cells': []}
+    report['model_config_sha256']=hashlib.sha256((args.formal/'models'/args.kind/'config.json').read_bytes()).hexdigest()
+    report['library_sha256']=hashlib.sha256(Path(os.environ['HYGEMM_LIBRARY' if args.kind=='hygemm' else 'MIXLLM_LIBRARY']).read_bytes()).hexdigest()
+    report['runtime_options']={name:os.environ.get(name,default) for name,default in
+        [('HYGEMM_PACK_MODE','0'),('HYGEMM_FUSE_SILU','0'),('HYGEMM_SILU_MATH','0'),('HYGEMM_ROW_ORDER','none'),('HYGEMM_FUSED_GATEUP','0')]}
     for batch in batches:
         prompts = [{'prompt_token_ids': tokens[i:i + args.context].tolist()} for i in offsets[:batch]]
 
