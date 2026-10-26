@@ -43,7 +43,7 @@ class OfflineConfig(HyGEMMConfig):
                 raise ValueError('Tuning plan is bound to a different FP4 bank')
             binding=self.decode_plans.binding
             defaults={'HYGEMM_PACK_MODE':'0','HYGEMM_FUSE_SILU':'0','HYGEMM_SILU_MATH':'0',
-                      'HYGEMM_ROW_ORDER':'none','HYGEMM_FUSED_GATEUP':'0'}
+                      'HYGEMM_ROW_ORDER':'none','HYGEMM_FUSED_GATEUP':'0','HYGEMM_FUSE_LLAMA':'0'}
             for name,value in binding.get('runtime_options',{}).items():
                 if name not in defaults or os.environ.get(name,defaults[name])!=str(value):
                     raise ValueError(f'Tuning plan runtime option mismatch: {name}')

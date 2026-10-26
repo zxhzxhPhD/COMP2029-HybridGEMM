@@ -31,13 +31,15 @@ using namespace cute;
 struct Options {
   int m=4096, n=128, k=4096, tile_n=64, iterations=100, repeats=3;
   std::string path="w4a8";
-  bool full_check=false;
+  bool full_check=false, online_pack=false;
   Options(int argc, char const** argv) {
     cutlass::CommandLine cmd(argc,argv);
     cmd.get_cmd_line_argument("m",m); cmd.get_cmd_line_argument("n",n);
     cmd.get_cmd_line_argument("k",k); cmd.get_cmd_line_argument("tile-n",tile_n);
     cmd.get_cmd_line_argument("iterations",iterations); cmd.get_cmd_line_argument("repeats",repeats);
     cmd.get_cmd_line_argument("path",path); full_check=cmd.check_cmd_line_flag("full-check");
+    online_pack=cmd.check_cmd_line_flag("online-pack");
+    if(online_pack && path=="fp8_lt") { std::cerr << "Online pack probe supports MX paths and FP16 only\n"; std::exit(1); }
     if(m<=0 || n<=0 || k<=0 || m%128 || k%128 || iterations<=0 || repeats<=0 ||
        (tile_n!=16 && tile_n!=64 && tile_n!=128)) { std::cerr << "Invalid options\n"; std::exit(1); }
   }
@@ -91,12 +93,14 @@ Check check_output(Options const& o, cutlass::half_t const* ptr) {
 }
 
 // CUDA graph avoids measuring CPU submission gaps for microsecond kernels.
-template<class F> std::vector<float> measure(F launch,cudaStream_t stream,int nodes,int repeats,int warm_ms=80) {
+template<class F> std::vector<float> measure(F launch,cudaStream_t stream,int nodes,int repeats,int warm_ms=80,int min_nodes_per_iteration=1) {
   launch(); CUDA_OK(cudaStreamSynchronize(stream));
   cudaGraph_t graph; cudaGraphExec_t executable;
   CUDA_OK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
   for(int i=0;i<nodes;++i) launch();
   CUDA_OK(cudaStreamEndCapture(stream,&graph));
+  size_t captured_nodes=0; CUDA_OK(cudaGraphGetNodes(graph,nullptr,&captured_nodes));
+  if(captured_nodes<size_t(nodes)*min_nodes_per_iteration) { std::cerr << "Incomplete CUDA graph capture\n"; std::exit(1); }
   CUDA_OK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
   auto t0=std::chrono::steady_clock::now();
   do {
@@ -120,7 +124,8 @@ void result(Options const&o,Check c,std::vector<float> const&t,std::string extra
   std::cout << std::setprecision(9) << "{\"path\":\"" << o.path << "\",\"m_out\":" << o.m
     << ",\"n_tokens\":" << o.n << ",\"k_in\":" << o.k << ",\"median_us\":" << us
     << ",\"tflops\":" << (2.0*o.m*o.n*o.k/us/1e6) << ",\"checked\":" << c.count
-    << ",\"failures\":" << c.failures << ",\"max_abs_error\":" << c.max_abs << ",\"samples_us\":[";
+    << ",\"failures\":" << c.failures << ",\"max_abs_error\":" << c.max_abs
+    << ",\"online_activation_pack\":" << (o.online_pack && o.path!="fp16" ? "true" : "false") << ",\"samples_us\":[";
   for(size_t i=0;i<t.size();++i) std::cout << (i ? "," : "") << t[i];
   std::cout << "]," << extra << "}" << std::endl;
   if(c.failures) std::exit(2);
@@ -145,6 +150,26 @@ template<class EA,class EB,int TN,bool Pingpong=false> struct Config {
   using Gemm=cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
+// Shared reference pack for format-boundary comparisons, not a claim of the
+// fastest possible quantizer. It uses each collective's actual scale layout.
+template<class B,class Layout>
+__global__ void pack_activation(cutlass::half_t const* input,uint8_t* output,uint8_t* sf,int rows,int k,Layout layout) {
+  int index=blockIdx.x*blockDim.x+threadIdx.x,lane=threadIdx.x%32,group=index/32;
+  if(group>=rows*(k/32))return;
+  int row=group/(k/32),col=(group%(k/32))*32+lane;
+  float value=float(input[int64_t(row)*k+col]),maximum=fabsf(value);
+  for(int d=16;d;d/=2)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d));
+  constexpr bool FP4=cutlass::sizeof_bits<B>::value==4;
+  int exponent=maximum>0?int(ceilf(log2f(maximum/(FP4?6.f:448.f)))):0;
+  exponent=max(-127,min(127,exponent));
+  if(lane==0)sf[layout(row,col,0)]=uint8_t(exponent+127);
+  unsigned code=B(ldexpf(value,-exponent)).raw();
+  if constexpr(FP4) {
+    unsigned pair=code|(__shfl_down_sync(0xffffffff,code,1)<<4);
+    if(!(lane&1))output[(int64_t(row)*k+col)/2]=uint8_t(pair);
+  }else output[int64_t(row)*k+col]=uint8_t(code);
+}
+
 template<class EA,class EB,int TN,bool Pingpong=false> void run_cutlass(Options const&o,cudaStream_t stream) {
   using Cfg=Config<EA,EB,TN,Pingpong>; using Gemm=typename Cfg::Gemm;
   using Kernel=typename Cfg::Kernel; using ML=typename Cfg::Mainloop;
@@ -160,10 +185,11 @@ template<class EA,class EB,int TN,bool Pingpong=false> void run_cutlass(Options 
   auto ta=make_tensor(sfa.data(),la), tb=make_tensor(sfb.data(),lb);
   for(int r=0;r<o.m;++r) for(int k=0;k<o.k;k+=32) ta(r,k,0)=cutlass::float_ue8m0_t(scale_value(r,k/32,88));
   for(int r=0;r<o.n;++r) for(int k=0;k<o.k;k+=32) tb(r,k,0)=cutlass::float_ue8m0_t(scale_value(r,k/32,100));
-  cutlass::device_memory::allocation<uint8_t> a,b;
+  cutlass::device_memory::allocation<uint8_t> a,b,activation_fp16;
   cutlass::device_memory::allocation<cutlass::float_ue8m0_t> da,db;
   upload(a,input_bytes<typename EA::DataType>(o.m,o.k,17,false));
   upload(b,input_bytes<typename EB::DataType>(o.n,o.k,29,false)); upload(da,sfa); upload(db,sfb);
+  if(o.online_pack)upload(activation_fp16,input_bytes<cutlass::half_t>(o.n,o.k,29,true));
   cutlass::device_memory::allocation<cutlass::half_t> d(int64_t(o.m)*o.n);
   CUDA_OK(cudaMemset(d.get(),0,d.size()*sizeof(cutlass::half_t)));
   typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,{o.m,o.n,o.k,1},
@@ -172,9 +198,17 @@ template<class EA,class EB,int TN,bool Pingpong=false> void run_cutlass(Options 
   Gemm gemm; CUTLASS_OK(gemm.can_implement(args));
   cutlass::device_memory::allocation<uint8_t> ws(Gemm::get_workspace_size(args));
   CUTLASS_OK(gemm.initialize(args,ws.get(),stream));
-  auto launch=[&] { CUTLASS_OK(gemm.run(stream)); };
+  auto launch=[&] {
+    if(o.online_pack) {
+      CUDA_OK(cudaMemsetAsync(db.get(),127,db.size()*sizeof(cutlass::float_ue8m0_t),stream));
+      pack_activation<typename EB::DataType><<<(int64_t(o.n)*o.k+127)/128,128,0,stream>>>(
+        reinterpret_cast<cutlass::half_t const*>(activation_fp16.get()),b.get(),reinterpret_cast<uint8_t*>(db.get()),o.n,o.k,lb);
+      CUDA_OK(cudaGetLastError());
+    }
+    CUTLASS_OK(gemm.run(stream));
+  };
   launch(); CUDA_OK(cudaStreamSynchronize(stream)); auto check=check_output(o,d.get());
-  auto times=measure(launch,stream,o.iterations,o.repeats);
+  auto times=measure(launch,stream,o.iterations,o.repeats,80,o.online_pack?3:1);
   cudaFuncAttributes attr; CUDA_OK(cudaFuncGetAttributes(&attr,cutlass::device_kernel<Kernel>));
   using Atom=typename ML::TiledMma::AtomShape_MNK;
   std::string extra="\"backend\":\"cutlass_mx\",\"tile\":[128,"+std::to_string(TN)+",128]"+

@@ -110,7 +110,7 @@ def main():
             groupkey=f'{kind}_{outputs}_{k}_{purity}'
             shortlists.setdefault(groupkey,{})
             if any(str(t) not in shortlists[groupkey] for t in buckets):
-                ids=torch.tensor(representative['high_ids'],device='cuda')
+                ids=torch.tensor(representative['high_ids'],device='cuda',dtype=torch.long)
                 r=DualLinear(weight,ids) if kind=='hygemm' else MixLinear(weight,ids)
                 index,rw=make_reference(r,kind)
                 for t in buckets:
@@ -145,7 +145,7 @@ def main():
                 del r,index,rw,x,dx,expected;gc.collect();torch.cuda.empty_cache()
             for case in group:
                 if all((kind,outputs,k,case['high'],t) in done for t in buckets):continue
-                ids=torch.tensor(case['high_ids'],device='cuda')
+                ids=torch.tensor(case['high_ids'],device='cuda',dtype=torch.long)
                 r=DualLinear(weight,ids) if kind=='hygemm' else MixLinear(weight,ids)
                 index,rw=make_reference(r,kind)
                 for t in buckets:
