@@ -21,6 +21,10 @@
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
+#ifdef HYGEMM_INTEGER_VARIANTS
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#endif
 
 using namespace cute;
 
@@ -28,8 +32,12 @@ using namespace cute;
 #define CUTLASS_OK(x) do { auto s=(x); if(s!=cutlass::Status::kSuccess) { std::cerr << #x << ": " << cutlassGetStatusString(s) << '\n'; std::exit(1); } } while(0)
 #define BLAS_OK(x) do { auto s=(x); if(s!=CUBLAS_STATUS_SUCCESS) { std::cerr << #x << ": " << int(s) << '\n'; std::exit(1); } } while(0)
 
+// Opt-in common exact domain for FP4/FP8/FP16 and signed INT4/INT8.
+// Keep the historical floating-only input generator unchanged by default.
+bool integer_compatible_inputs=false;
 struct Options {
   int m=4096, n=128, k=4096, tile_n=64, iterations=100, repeats=3;
+  int int_variant=0;
   std::string path="w4a8";
   bool full_check=false, online_pack=false;
   Options(int argc, char const** argv) {
@@ -39,6 +47,8 @@ struct Options {
     cmd.get_cmd_line_argument("iterations",iterations); cmd.get_cmd_line_argument("repeats",repeats);
     cmd.get_cmd_line_argument("path",path); full_check=cmd.check_cmd_line_flag("full-check");
     online_pack=cmd.check_cmd_line_flag("online-pack");
+    integer_compatible_inputs=cmd.check_cmd_line_flag("integer-compatible");
+    cmd.get_cmd_line_argument("int-variant",int_variant);
     if(online_pack && path=="fp8_lt") { std::cerr << "Online pack probe supports MX paths and FP16 only\n"; std::exit(1); }
     if(m<=0 || n<=0 || k<=0 || m%128 || k%128 || iterations<=0 || repeats<=0 ||
        (tile_n!=16 && tile_n!=64 && tile_n!=128)) { std::cerr << "Invalid options\n"; std::exit(1); }
@@ -52,10 +62,13 @@ uint32_t hash32(uint32_t x) {
 // Every path computes the same mathematical matrix (this is NOT an accuracy study).
 float raw_value(int row,int col,int seed) {
   static constexpr float v[]={-2,-1.5f,-1,-0.5f,0.5f,1,1.5f,2};
+  static constexpr float iv[]={-3,-2,-1,0,0,1,2,3};
+  if(integer_compatible_inputs) return iv[hash32(uint32_t(row)*0x9e3779b9u+uint32_t(col)+uint32_t(seed))&7];
   return v[hash32(uint32_t(row)*0x9e3779b9u+uint32_t(col)+uint32_t(seed))&7];
 }
 float scale_value(int row,int group,int seed) {
   static constexpr float s[]={0.5f,1,2};
+  if(integer_compatible_inputs) return float(1u<<(hash32(uint32_t(row)*0x85ebca6bu+uint32_t(group)+uint32_t(seed))&1));
   return s[hash32(uint32_t(row)*0x85ebca6bu+uint32_t(group)+uint32_t(seed))%3];
 }
 float value(int row,int col,int seed) { return raw_value(row,col,seed)*scale_value(row,col/32,seed+71); }
@@ -125,12 +138,14 @@ void result(Options const&o,Check c,std::vector<float> const&t,std::string extra
     << ",\"n_tokens\":" << o.n << ",\"k_in\":" << o.k << ",\"median_us\":" << us
     << ",\"tflops\":" << (2.0*o.m*o.n*o.k/us/1e6) << ",\"checked\":" << c.count
     << ",\"failures\":" << c.failures << ",\"max_abs_error\":" << c.max_abs
+    << ",\"input_domain\":\"" << (integer_compatible_inputs ? "common_signed_int4_exact" : "original_mx") << "\""
     << ",\"online_activation_pack\":" << (o.online_pack && o.path!="fp16" ? "true" : "false") << ",\"samples_us\":[";
   for(size_t i=0;i<t.size();++i) std::cout << (i ? "," : "") << t[i];
   std::cout << "]," << extra << "}" << std::endl;
   if(c.failures) std::exit(2);
 }
 
+#ifndef HYGEMM_INTEGER_VARIANTS
 template<class EA,class EB,int TN,bool Pingpong=false> struct Config {
   using Tile=Shape<_128,Int<TN>,_128>; using Cluster=Shape<_1,_1,_1>;
   using Epilogue=typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -305,3 +320,66 @@ int main(int argc,char const**argv) {
   else { std::cerr << "Unknown path\n"; return 1; }
   CUDA_OK(cudaStreamDestroy(stream));
 }
+#else
+// Four fixed cp.async Tensor Core candidates, with no split-K or extra search.
+// INT MMA accumulates in S32; the fused epilogue converts to the common FP16 Y.
+template<class T,int TN,int WM,int WN,int Stages>
+void run_integer(Options const& o,cudaStream_t stream) {
+  constexpr int Bits=cutlass::sizeof_bits<T>::value, MK=Bits==4 ? 64 : 32;
+  using Gemm=cutlass::gemm::device::Gemm<
+    T,cutlass::layout::RowMajor,T,cutlass::layout::ColumnMajor,
+    cutlass::half_t,cutlass::layout::ColumnMajor,int32_t,
+    cutlass::arch::OpClassTensorOp,cutlass::arch::Sm80,
+    // ColumnMajor device::Gemm transposes the problem internally, but does
+    // not transpose these shapes: provide tokens x output-channel tiles.
+    cutlass::gemm::GemmShape<TN,128,128>,cutlass::gemm::GemmShape<WN,WM,128>,
+    cutlass::gemm::GemmShape<16,8,MK>,
+    cutlass::epilogue::thread::LinearCombination<cutlass::half_t,8,int32_t,float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,Stages,
+    128/Bits,128/Bits,false,cutlass::arch::OpMultiplyAddSaturate>;
+  cutlass::device_memory::allocation<uint8_t> a,b;
+  upload(a,input_bytes<T>(o.m,o.k,17,true));
+  upload(b,input_bytes<T>(o.n,o.k,29,true));
+  cutlass::device_memory::allocation<cutlass::half_t> d(int64_t(o.m)*o.n);
+  CUDA_OK(cudaMemset(d.get(),0,d.size()*sizeof(cutlass::half_t)));
+  typename Gemm::Arguments args({o.m,o.n,o.k},
+    {reinterpret_cast<T*>(a.get()),o.k},{reinterpret_cast<T*>(b.get()),o.k},
+    {d.get(),o.m},{d.get(),o.m},{1.f,0.f});
+  Gemm gemm; CUTLASS_OK(gemm.can_implement(args));
+  cutlass::device_memory::allocation<uint8_t> ws(Gemm::get_workspace_size(args));
+  CUTLASS_OK(gemm.initialize(args,ws.get(),stream));
+  auto launch=[&]{ CUTLASS_OK(gemm.run(stream)); };
+  launch(); CUDA_OK(cudaStreamSynchronize(stream)); auto check=check_output(o,d.get());
+  auto times=measure(launch,stream,o.iterations,o.repeats);
+  using Kernel=typename Gemm::GemmKernel;
+  cudaFuncAttributes attr; CUDA_OK(cudaFuncGetAttributes(&attr,cutlass::Kernel<Kernel>));
+  result(o,check,times,"\"backend\":\"cutlass_int\",\"accumulator\":\"s32\",\"throughput_unit\":\"TOP/s\",\"tile\":[128,"+
+    std::to_string(TN)+",128],\"warp\":["+std::to_string(WM)+","+std::to_string(WN)+",128]"+
+    ",\"int_variant\":"+std::to_string(o.int_variant)+",\"schedule\":\"cp_async\",\"mma_k\":"+std::to_string(MK)+
+    ",\"stages\":"+std::to_string(Stages)+",\"registers_per_thread\":"+std::to_string(attr.numRegs)+
+    ",\"shared_bytes\":"+std::to_string(sizeof(typename Kernel::SharedStorage))+
+    ",\"local_bytes\":"+std::to_string(attr.localSizeBytes)+",\"smem_operand_bits\":["+std::to_string(Bits)+","+std::to_string(Bits)+"]");
+}
+template<class T> void dispatch_integer(Options const& o,cudaStream_t stream) {
+  switch(o.int_variant) {
+    case 0: run_integer<T,64,64,32,3>(o,stream); break;
+    case 1: run_integer<T,128,64,64,3>(o,stream); break;
+    case 2: run_integer<T,16,64,16,3>(o,stream); break;
+    case 3: run_integer<T,64,64,32,4>(o,stream); break;
+    default: std::cerr<<"int-variant must be 0..3\n"; std::exit(1);
+  }
+}
+int main(int argc,char const** argv) {
+  Options o(argc,argv); cudaDeviceProp p; CUDA_OK(cudaGetDeviceProperties(&p,0));
+  if(p.major!=12 || !integer_compatible_inputs || o.online_pack) {
+    std::cerr<<"Integer probe requires SM12x, --integer-compatible and prepacked inputs\n"; return 1;
+  }
+  cudaStream_t stream; CUDA_OK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+  if(o.path=="int8") dispatch_integer<int8_t>(o,stream);
+#ifndef HYGEMM_SKIP_INT4
+  else if(o.path=="int4") dispatch_integer<cutlass::int4b_t>(o,stream);
+#endif
+  else { std::cerr<<"Unknown integer path\n"; return 1; }
+  CUDA_OK(cudaStreamDestroy(stream));
+}
+#endif

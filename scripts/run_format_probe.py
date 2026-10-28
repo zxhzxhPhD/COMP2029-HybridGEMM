@@ -26,8 +26,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--integer-binary", type=Path, help="Add four fixed INT8/INT4 configurations on the existing shapes")
+    parser.add_argument("--integer-compatible", action="store_true", help="Use a shared exactly representable signed INT4 input domain for all paths")
+    parser.add_argument("--skip-int4", action="store_true")
     parser.add_argument("--tuned", action="store_true", help="Run the two additional tuned variants and merge with results.jsonl")
     args = parser.parse_args()
+    if args.integer_binary and not args.integer_compatible:
+        parser.error("--integer-binary requires --integer-compatible")
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
@@ -49,17 +54,29 @@ def main():
         "excluded": "quantization, online packing, output-channel split/scatter, model accuracy; no INT MixLLM comparison",
     }
     metadata["reduction_policy"] = "cuBLASLt split-K intermediate storage restricted to FP32 compute type"
+    if args.integer_compatible:
+        metadata["input_domain"] = "Common exact domain: raw [-3,-2,-1,0,0,1,2,3], per-K32 scales 1 or 2; decoded values in [-6,6]. MX keeps block scales, other formats absorb scales offline. Same hash functions and seeds as original."
+        metadata["low_precision"] += "; INT8/INT4 use S32 accumulation and fused FP16 output; no groupwise quantization or dequantization"
+        metadata["excluded"] = "quantization, online packing, output-channel split/scatter, model accuracy and actual MixLLM pipeline"
+    if args.integer_binary:
+        metadata["integer_binary_sha256"] = hashlib.sha256(args.integer_binary.read_bytes()).hexdigest()
+        metadata["integer_candidates"] = ["128x64x128 warp64x32 stages3", "128x128x128 warp64x64 stages3", "128x16x128 warp64x16 stages3", "128x64x128 warp64x32 stages4"]
     suffix = "_tuned" if args.tuned else ""
     (args.out / f"environment{suffix}.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     configs = [(p, t) for p in ["w4a4", "w4a8", "w8a8_mx"] for t in [64, 128]] + [("fp16", 64), ("fp8_lt", 64)]
     if args.tuned:
         configs = [(p, t) for p in ["w4a4", "w4a8", "w8a8_mx"] for t in [16, 64]]
+    elif args.integer_binary:
+        configs += [(p, v) for p in (["int8"] if args.skip_int4 else ["int8", "int4"]) for v in range(4)]
 
     def run(shape, config, smoke=False):
         m, n, k = shape
         path, tile = config
-        cmd = [str(args.binary), f"--m={m}", f"--n={n}", f"--k={k}",
-               f"--path={path}", f"--tile-n={tile}", "--iterations=100", "--repeats=3"]
+        integer = path in ("int8", "int4")
+        cmd = [str(args.integer_binary if integer else args.binary), f"--m={m}", f"--n={n}", f"--k={k}",
+               f"--path={path}", f"--int-variant={tile}" if integer else f"--tile-n={tile}", "--iterations=100", "--repeats=3"]
+        if args.integer_compatible:
+            cmd.append("--integer-compatible")
         if smoke:
             cmd.append("--full-check")
         start = gpu()
@@ -71,6 +88,8 @@ def main():
         row = json.loads(next(line for line in proc.stdout.splitlines() if line.startswith('{"path"')))
         assert row["failures"] == 0 and row["median_us"] > 0
         row.update(gpu_before=start, gpu_after=gpu(), smoke=smoke)
+        row["throughput_unit"] = "TOP/s" if integer else "TFLOP/s"
+        row["accumulator"] = "s32" if integer else "f32"
         print(stem, f'{row["median_us"]:.3f} us', flush=True)
         return row
 
@@ -103,12 +122,14 @@ def main():
     summary = []
     for shape in shapes:
         base = best[(*shape, "fp16")]["median_us"]
-        for path in ["fp16", "w4a8", "w8a8_mx", "w4a4", "fp8_lt"]:
+        for path in ["fp16", "w4a8", "w8a8_mx", "w4a4", "fp8_lt", "int8", "int4"]:
+            if (*shape, path) not in best:
+                continue
             row = dict(best[(*shape, path)])
             row["speedup_vs_fp16"] = base / row["median_us"]
             summary.append(row)
     (args.out / f"summary{suffix}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    fields = ["m_out", "n_tokens", "k_in", "path", "median_us", "tflops", "speedup_vs_fp16", "tile", "schedule", "samples_us"]
+    fields = ["m_out", "n_tokens", "k_in", "path", "median_us", "tflops", "throughput_unit", "accumulator", "speedup_vs_fp16", "tile", "schedule", "samples_us"]
     with (args.out / f"summary{suffix}.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()

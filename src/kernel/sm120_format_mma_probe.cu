@@ -11,10 +11,17 @@
 using F4=cutlass::float_e2m1_t;
 using F8=cutlass::float_e4m3_t;
 using SF=cutlass::float_ue8m0_t;
-template<int P> __device__ __forceinline__ void mma(float(&a)[4]) {
+template<int P> using Acc=typename std::conditional<(P>=4),uint32_t,float>::type;
+template<int P> __device__ __forceinline__ void mma(Acc<P>(&a)[4]) {
   if constexpr(P==0) {
     constexpr uint32_t v=0x3c003c00;
     cute::SM80_16x8x16_F32F16F16F32_TN::fma(a[0],a[1],a[2],a[3],v,v,v,v,v,v,a[0],a[1],a[2],a[3]);
+  } else if constexpr(P==4) {
+    constexpr uint32_t v=0x01010101;
+    cute::SM80_16x8x32_S32S8S8S32_TN_SATURATE::fma(a[0],a[1],a[2],a[3],v,v,v,v,v,v,a[0],a[1],a[2],a[3]);
+  } else if constexpr(P==5) {
+    constexpr uint32_t v=0x11111111;
+    cute::SM80_16x8x64_S32S4S4S32_TN_SATURATE::fma(a[0],a[1],a[2],a[3],v,v,v,v,v,v,a[0],a[1],a[2],a[3]);
   } else if constexpr(P==3) {
     constexpr uint32_t v=0x22222222;
     cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<F4,F4,float,SF,32>::fma(
@@ -27,12 +34,12 @@ template<int P> __device__ __forceinline__ void mma(float(&a)[4]) {
   }
 }
 template<int P> __global__ void probe(float* out,int iters) {
-  float a[4][4]{};
+  Acc<P> a[4][4]{};
   for(int i=0;i<iters;++i) {
 #pragma unroll
     for(int j=0;j<4;++j) mma<P>(a[j]);
   }
-  float sum=0;
+  Acc<P> sum=0;
 #pragma unroll
   for(int j=0;j<4;++j) {
 #pragma unroll
@@ -41,7 +48,7 @@ template<int P> __global__ void probe(float* out,int iters) {
   out[blockIdx.x*blockDim.x+threadIdx.x]=sum;
 }
 template<int P> void run(int grid,float* out) {
-  constexpr int block=256,iters=2048,k=P==0 ? 16 : (P==3 ? 64 : 32);
+  constexpr int block=256,iters=2048,k=P==0 ? 16 : ((P==3 || P==5) ? 64 : 32);
   auto t0=std::chrono::steady_clock::now();
   do { probe<P><<<grid,block>>>(out,iters); CK(cudaDeviceSynchronize()); }
   while(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count()<100);
@@ -57,16 +64,21 @@ template<int P> void run(int grid,float* out) {
   int failures=0; for(float v:h) failures+=(v!=float(iters*k*16));
   cudaFuncAttributes attr; CK(cudaFuncGetAttributes(&attr,probe<P>));
   std::vector<float> sorted=times;std::sort(sorted.begin(),sorted.end());
-  const char* names[]={"fp16","w4a8","w8a8_mx","w4a4"};
+  const char* names[]={"fp16","w4a8","w8a8_mx","w4a4","int8","int4"};
   std::cout<<"{\"path\":\""<<names[P]<<"\",\"mma_k\":"<<k<<",\"median_us\":"<<sorted[1]
     <<",\"tflops\":"<<(2.0*16*8*k*iters*4*(block/32)*grid/sorted[1]/1e6)
     <<",\"samples_us\":["<<times[0]<<','<<times[1]<<','<<times[2]<<"],\"failures\":"<<failures
     <<",\"registers\":"<<attr.numRegs<<",\"grid\":"<<grid<<",\"block\":"<<block
+    <<",\"accumulator\":\""<<(P>=4 ? "s32" : "f32")<<"\",\"throughput_unit\":\""<<(P>=4 ? "TOP/s" : "TFLOP/s")<<"\""
     <<",\"iterations\":"<<iters<<",\"chains\":4}"<<std::endl;
   CK(cudaEventDestroy(a));CK(cudaEventDestroy(b)); if(failures) std::exit(2);
 }
 int main(){
   cudaDeviceProp p;CK(cudaGetDeviceProperties(&p,0));if(p.major!=12)return 1;
   int grid=p.multiProcessorCount*4;float* out;CK(cudaMalloc(&out,grid*256*sizeof(float)));
-  run<0>(grid,out);run<1>(grid,out);run<2>(grid,out);run<3>(grid,out);CK(cudaFree(out));
+  run<0>(grid,out);run<1>(grid,out);run<2>(grid,out);run<3>(grid,out);run<4>(grid,out);
+#ifndef HYGEMM_SKIP_INT4
+  run<5>(grid,out);
+#endif
+  CK(cudaFree(out));
 }

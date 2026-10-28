@@ -129,6 +129,18 @@ target_include_directories(hygemm_sm120_format_mma_probe PRIVATE "${CUTLASS_DIR}
 target_compile_options(hygemm_sm120_format_mma_probe PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr;-lineinfo>)
 
+add_executable(hygemm_sm120_format_int_probe src/kernel/sm120_format_probe.cu)
+target_include_directories(hygemm_sm120_format_int_probe PRIVATE
+  "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
+target_compile_definitions(hygemm_sm120_format_int_probe PRIVATE HYGEMM_INTEGER_VARIANTS=1)
+target_compile_options(hygemm_sm120_format_int_probe PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo;-Xptxas=-v>)
+option(HYGEMM_FORMAT_SKIP_INT4 "Skip unsupported INT4 MMA in format probes" OFF)
+if(HYGEMM_FORMAT_SKIP_INT4)
+  target_compile_definitions(hygemm_sm120_format_mma_probe PRIVATE HYGEMM_SKIP_INT4=1)
+  target_compile_definitions(hygemm_sm120_format_int_probe PRIVATE HYGEMM_SKIP_INT4=1)
+endif()
+
 # Small, fixed candidate family. Compile variants separately to bound compiler memory.
 set(OC_TILES_N 16 32 64 128 16 32 64 64)
 set(OC_TILES_K 128 128 128 128 256 256 128 128)
